@@ -50,6 +50,11 @@ QTY_RE      = re.compile(
     r"^([\d,]+\.?\d*)(SF|LF|SY|EA|HR|DA|LS|SQ|MO|WK|GL|LB|CF|CY|TN|PR|BX|RL|BD|CS|PC|FT|IN|MM|CM|M2|M3)$",
     re.I,
 )
+NUM_RE      = re.compile(r"^[\d,]+\.?\d*$")
+UNIT_ONLY   = {"SF","LF","SY","EA","HR","DA","LS","SQ","MO","WK","GL","LB",
+               "CF","CY","TN","PR","BX","RL","BD","CS","PC","FT","IN","MM",
+               "CM","M2","M3"}
+FOOTER_SKIP = re.compile(r"^\d{1,2}/\d{1,2}/\d{4}$|^Page:$")
 
 SKIP_WORDS = {
     "DESCRIPTION", "Totals:", "Total:", "WALLS/CEILING", "MISC", "FLOORING",
@@ -84,16 +89,47 @@ def infer_activity(desc):
 
 def _absorb_row(row_words, item):
     desc_parts = []
+    pending_qty_num = None  # bare number in qty zone awaiting its unit word
+
     for w in row_words:
         col = classify_word(w)
         txt = w["text"]
-        if col in ("desc", "qty"):
+
+        if FOOTER_SKIP.match(txt):
+            pending_qty_num = None
+            continue
+
+        if col == "desc":
+            # Unit word that completes a pending qty number?
+            if pending_qty_num is not None and txt.upper() in UNIT_ONLY:
+                item["qty"]  = pending_qty_num
+                item["unit"] = txt.upper()
+                pending_qty_num = None
+                continue
+            if pending_qty_num is not None:
+                item["qty"] = pending_qty_num
+                pending_qty_num = None
             m = QTY_RE.match(txt)
             if m:
                 item["qty"]  = float(m.group(1).replace(",", ""))
                 item["unit"] = m.group(2).upper()
             else:
                 desc_parts.append(txt)
+
+        elif col == "qty":
+            m = QTY_RE.match(txt)
+            if m:
+                item["qty"]  = float(m.group(1).replace(",", ""))
+                item["unit"] = m.group(2).upper()
+                pending_qty_num = None
+            elif NUM_RE.match(txt):
+                pending_qty_num = float(txt.replace(",", ""))
+            elif txt.upper() in UNIT_ONLY and pending_qty_num is not None:
+                item["qty"]  = pending_qty_num
+                item["unit"] = txt.upper()
+                pending_qty_num = None
+            # (anything else in the qty zone is silently dropped)
+
         elif col == "unit_price":
             try:    item["unit_cost"] = float(txt.replace(",", ""))
             except: desc_parts.append(txt)
@@ -106,6 +142,9 @@ def _absorb_row(row_words, item):
         elif col == "acv":
             try:    item["acv"] = float(txt.replace(",", "").strip("()"))
             except: pass
+
+    if pending_qty_num is not None:
+        item["qty"] = pending_qty_num
     if desc_parts:
         item["desc"] = (item["desc"] + " " + " ".join(desc_parts)).strip()
 
@@ -227,42 +266,20 @@ def build_xlsx(items):
         c.alignment = Alignment(horizontal="center", wrap_text=True)
         c.border = THIN_BORDER
 
-    today = datetime.today()
-
+    # Only 6 columns are populated; everything else stays blank.
     for ri, item in enumerate(items, 2):
-        qty  = item.get("qty") or 0
-        cost = item.get("unit_cost") or 0
         vals = {
-            "#": item["item_num"],
-            "Group Code": item["room_code"],
+            "#":                 item["item_num"],
             "Group Description": item["room_name"],
-            "Desc": item["desc"],
-            "Age": 0, "Condition": "Average",
-            "Qty": qty,
-            "Item Amount": round(qty * cost, 2),
-            "Reported Cost": 0,
-            "Unit Cost": cost,
-            "Unit": item.get("unit") or "",
-            "Coverage": "Dwelling",
-            "Activity": infer_activity(item["desc"]),
-            "Worker's Wage": "", "Labor burden": "", "Labor Overhead": "",
-            "Material": "", "Equipment": "", "Market Conditions": "",
-            "Labor Minimum": "",
-            "Sales Tax": item.get("sales_tax") or 0,
-            "RCV": item.get("rcv") or 0,
-            "Life": "", "Depreciation Type": "Percent",
-            "Depreciation Amount": 0, "Recoverable": "Yes",
-            "ACV": item.get("acv") or 0,
-            "Tax": "Yes", "Replace": "No",
-            "Cat": "", "Sel": "", "Owner": "", "Original Vendor": "",
-            "Date": today, "Note 1": "", "Source Name": "",
+            "Desc":              item["desc"],
+            "Qty":               item.get("qty") or 0,
+            "Unit":              item.get("unit") or "",
+            "Activity":          infer_activity(item["desc"]),
         }
         for ci, h in enumerate(HEADERS, 1):
-            c = ws.cell(row=ri, column=ci, value=vals[h])
+            c = ws.cell(row=ri, column=ci, value=vals.get(h, ""))
             c.font = BODY_FONT
             c.border = THIN_BORDER
-            if h == "Date":
-                c.number_format = "MM/DD/YYYY"
 
     col_widths = {1:5, 2:18, 3:20, 4:45, 5:6, 6:10, 7:8, 8:12,
                   9:12, 10:10, 11:6, 12:10, 13:20}
